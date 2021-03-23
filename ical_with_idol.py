@@ -1,10 +1,11 @@
 import calendar
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import re
 
 from bs4 import BeautifulSoup as bs
 import chromedriver_binary
 from icalendar import Calendar, Event
+import pytz
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -23,6 +24,28 @@ RADIO_DESCRIPTION = (
     '▼メッセージ受付はこちら！\n'
     'cynhn@fmfuji.jp'
 )
+JST = pytz.timezone('Asia/Tokyo')
+PATS = [
+    re.compile(r'OPEN (?P<open>[:\d]+)'),
+    re.compile(r'開場 (?P<open>[\d]+:[\d]+) / 開演 (?P<start>[\d]+:[\d]+)'),
+    re.compile(r'開場(?P<open>[\d]+:[\d]+)/開演(?P<start>[\d]+:[\d]+)'),
+    re.compile(r'開場/開演：(?P<open>[\d]+:[\d]+)/(?P<start>[\d]+:[\d]+)'),
+    re.compile(r'OPEN START：(?P<open>[\d:]+) / (?P<start>[\d:]+)'),
+]
+START_PAT = re.compile(r'(?P<start>[\d]+:[\d]*)頃〜')
+
+
+def ayase_shiki_noten(date_dt):
+    dtstart = datetime(
+        date_dt.year,
+        date_dt.month,
+        date_dt.day,
+        12,
+        00,
+        tzinfo=JST,
+    )
+    dtend = dtstart + timedelta(hours=6, minutes=00)
+    return dtstart, dtend
 
 
 def init_driver() -> webdriver.Chrome:
@@ -63,7 +86,27 @@ def get_description(content_href, soup):
     paragraph += f'{BASE_URL}/{content_href}\n'
     for p in body.find_all('p'):
         paragraph += f'{p.text}\n'
+    paragraph = paragraph.replace(u'\xa0', ' ')
     return paragraph
+
+
+def parse_open_time(description):
+    g = START_PAT.search(description)
+    start_time = ''
+    if g:
+        start_time = g['start']
+    else:
+        for pat in PATS:
+            g = pat.search(description)
+            if g:
+                start_time = g['open']
+                break
+    if g:
+        print(start_time)
+        hour = start_time.split(':')[0]
+        minutes = start_time.split(':')[1]
+        return int(hour), int(minutes)
+    return 0, 0
 
 
 def make_event(ical, content_href):
@@ -72,16 +115,35 @@ def make_event(ical, content_href):
     summary = soup.find('h2', class_='title').text
     category = soup.find('p', class_='tag').text
     date_raw = soup.find('p', class_='date').text
+    description = get_description(content_href, soup)
     g = DATE_PAT.search(date_raw)
     date_dt = datetime.strptime(g['date'], '%Y.%m.%d')
-    if not is_radio(summary):
-        print(g['date'], category, summary)
-        event = Event()
+    hour, minutes = parse_open_time(description)
+    dtstart = datetime(
+        date_dt.year,
+        date_dt.month,
+        date_dt.day,
+        hour,
+        minutes,
+        tzinfo=JST,
+    )
+    dtend = dtstart + timedelta(hours=2, minutes=30)
+    # 綾瀬志希展対応
+    if '綾瀬志希展〜脳〜' in summary:
+        dtstart, dtend = ayase_shiki_noten(date_dt)
+    event = Event()
+    summaries = [
+        subcomponent['summary'].encode('utf-8')
+        for subcomponent in ical.subcomponents
+    ]
+    byted_summary = summary.encode('utf-8')
+    if not is_radio(summary) and byted_summary not in summaries:
+        print(g['date'], category, summary, dtstart, dtend)
         event.add('summary', summary)
-        event.add('dtstart', date_dt)
-        event.add('dtend', date_dt)
+        event.add('dtstart', dtstart)
+        event.add('dtend', dtend)
         event.add('category', category)
-        event.add('description', get_description(content_href, soup))
+        event.add('description', description)
         ical.add_component(event)
 
 
@@ -93,16 +155,28 @@ def add_radio_schedule(ical):
     for week in weeks:
         for day in week:
             if day[1] == 3 and day[0] > 0:
-                radio_days.append(datetime(
+                dtstart = datetime(
                     today.year,
                     today.month,
-                    day[0]
-                ))
-    for radio_day in radio_days:
+                    day[0],
+                    23,
+                    30,
+                    tzinfo=JST,
+                )
+                dtend = datetime(
+                    today.year,
+                    today.month,
+                    day[0]+1,
+                    0,
+                    0,
+                    tzinfo=JST,
+                )
+                radio_days.append((dtstart, dtend))
+    for times in radio_days:
         event = Event()
         event.add('summary', RADIO_SUMMARY)
-        event.add('dtstart', radio_day)
-        event.add('dtend', radio_day)
+        event.add('dtstart', times[0])
+        event.add('dtend', times[1])
         event.add('category', RADIO_CATEGORY)
         event.add('description', RADIO_DESCRIPTION)
         ical.add_component(event)
